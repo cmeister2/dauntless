@@ -20,11 +20,17 @@ $(TEST_DATA_FILE):
 NAME_DATA_FILE := $(dir $(DATA_FILE))name_$(notdir $(DATA_FILE))
 $(info ** NAME DATA $(NAME_DATA_FILE))
 
+# Use jq with parallels to generate the data set. Use line-buffer as a speed-up
+# which preserves lines (at the expense of CPU).  Use a big buffer because
+# otherwise jq doesn't do enough work.
 create_name_data: $(NAME_DATA_FILE)
 $(NAME_DATA_FILE): $(DATA_FILE)
 	@echo "Creating $@ from $<"
-	pv $< | pigz -dc | jq -r .name | pigz -c > $@
-
+	pv -cN datafile $< | \
+		pigz -dc | \
+		parallel --no-notice --pipe --line-buffer --block 50M jq -r .name | \
+		pv -cN processed | \
+		pigz -c > $@
 
 # Have a target to clean up all generated files
 .PHONY: clean
