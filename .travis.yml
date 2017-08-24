@@ -10,4 +10,4 @@ addons:
       - parallel
 
 script:
-- make create_name_data
+- ./makeenv all
