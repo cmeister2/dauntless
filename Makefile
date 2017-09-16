@@ -10,10 +10,13 @@ DATA_FILE_BASE := $(notdir $(DATA_FILE))
 # Name field from the data set
 NAME_DATA_FILE := $(DATA_FILE_DIR)name_$(DATA_FILE_BASE)
 
-# Subdomain and TLD from name set
-SUBTLD_DATA_FILE := $(DATA_FILE_DIR)subtld_$(DATA_FILE_BASE)
+# Subdomain from name set
+SUB_DATA_FILE := $(DATA_FILE_DIR)subdomain_$(DATA_FILE_BASE)
+SUBSET_SUB_DATA_FILE := $(DATA_FILE_DIR)subset_subdomain_$(DATA_FILE_BASE)
+SORTED_SUB_DATA_FILE := $(DATA_FILE_DIR)sorted_sub_$(DATA_FILE_BASE)
+COUNTED_SUB_DATA_FILE := $(DATA_FILE_DIR)counted_sub_$(DATA_FILE_BASE)
+TOP_SUB_DATA_FILE := $(DATA_FILE_DIR)top_sub_$(DATA_FILE_BASE)
 
-# Get the number of processors available for multithreaded apps
 NUM_PROCS := $(shell nproc)
 ifeq ($(NUM_PROCS),)
 NUM_PROCS := 1
@@ -24,14 +27,18 @@ SORT_MEMORY_LIMIT ?= 2G
 SORT_MEMORY_FOLDER ?= $(DATA_FILE_DIR)/.sorttmp
 
 # Print a summary of the information
-$(info ** DATA FILE $(DATA_FILE))
-$(info ** NAME DATA $(NAME_DATA_FILE))
-$(info ** SUBTLD DATA $(SUBTLD_DATA_FILE))
+$(info ** [Step 0] Data File               $(DATA_FILE))
+$(info ** [Step 1] Name Data               $(NAME_DATA_FILE))
+$(info ** [Step 2] Subdomain Data          $(SUB_DATA_FILE))
+$(info ** [Step 3] Sorted Subdomain Data   $(SORTED_SUB_DATA_FILE))
+$(info ** [Step 4] Counted Subdomain Data  $(COUNTED_SUB_DATA_FILE))
+$(info ** [Step 5] Top Subdomain Data      $(TOP_SUB_DATA_FILE))
+# $(info ** [Step 5] Filtered Pinyin Data $(NONPINYIN_DATA_FILE))
 $(info ** NUM PROCS $(NUM_PROCS))
 $(info ** SORT OPTIONS $(SORT_MEMORY_LIMIT) $(SORT_MEMORY_FOLDER))
 
 # Make an "all" target.
-all: step2
+all: step5
 
 # For the purposes of CI, have a test data set of the first TEST_DATA_LINES
 # lines of the data set.
@@ -51,7 +58,7 @@ $(TEST_DATA_FILE):
 # to naively deduplicate the output.
 step1: $(NAME_DATA_FILE)
 $(NAME_DATA_FILE): $(DATA_FILE)
-	@echo "Step 1: Creating $@ from $<"
+	@echo "Step 1 (jq extraction): Creating $@ from $<"
 	pv -cN input $< | \
 		pigz -dc | \
 		parallel --no-notice --pipe --line-buffer --block 50M jq -r .name | \
@@ -61,16 +68,57 @@ $(NAME_DATA_FILE): $(DATA_FILE)
 		pigz -c | \
 		pv -cN output > $@
 
-# Use tldextract in python to extract the subdomain and tld. Output them as
-# a colon-separated file. This filters out all domains which don't have a 
-# subdomain.
-step2: $(SUBTLD_DATA_FILE)
-$(SUBTLD_DATA_FILE): $(NAME_DATA_FILE)
-	@echo "Step 2: Creating $@ from $<"
+# Use tldextract in python to extract the subdomain.
+# This filters out all domains which don't have a subdomain.
+step2: $(SUB_DATA_FILE)
+$(SUB_DATA_FILE): $(NAME_DATA_FILE)
+	@echo "Step 2 (subdomain extraction): Creating $@ from $<"
 	pv -cN input $< | \
 		pigz -dc | \
-		parallel --no-notice --pipe --line-buffer --block 50M python3 ./subtld.py | \
+		parallel --no-notice --pipe --line-buffer --block 50M python3 ./subdomain.py | \
 		pv -cN postpython | \
+		pigz -c | \
+		pv -cN output > $@
+
+# At this point we're going to sort the subdomains ready for counting.
+step3: $(SORTED_SUB_DATA_FILE)
+$(SORTED_SUB_DATA_FILE): $(SUB_DATA_FILE)
+	@echo "Step 3 (subdomain sorting): Creating $@ from $<"
+	pv -cN input $< | \
+		pigz -dc | \
+		sort --parallel=$(NUM_PROCS) -S $(SORT_MEMORY_LIMIT) -T $(SORT_MEMORY_FOLDER) | \
+		pigz -c | \
+		pv -cN output > $@
+
+# Count the instances of the subdomains.
+step4: $(COUNTED_SUB_DATA_FILE)
+$(COUNTED_SUB_DATA_FILE): $(SORTED_SUB_DATA_FILE)
+	@echo "Step 4 (subdomain counting): Creating $@ from $<"
+	pv -cN input $< | \
+		pigz -dc | \
+		uniq -c | \
+		pigz -c | \
+		pv -cN output > $@
+
+# Reverse sort the subdomains by the numeric count to get the top domains
+# including pinyin.
+step5: $(TOP_SUB_DATA_FILE)
+$(TOP_SUB_DATA_FILE): $(COUNTED_SUB_DATA_FILE)
+	@echo "Step 5 (top subdomains): Creating $@ from $<"
+	pv -cN input $< | \
+		pigz -dc | \
+		sort -rg --parallel=$(NUM_PROCS) -S $(SORT_MEMORY_LIMIT) -T $(SORT_MEMORY_FOLDER) | \
+		pigz -c | \
+		pv -cN output > $@
+
+# Use the filterpinyin script to filter out domains which look like pinyin.
+# This doesn't have to be perfect but we want to get rid of the most obvious ones.
+nonstep5: $(NONPINYIN_DATA_FILE)
+$(NONPINYIN_DATA_FILE): $(COUNTED_SUB_DATA_FILE)
+	@echo "Step 5 (pinyin filtering): Creating $@ from $< [SLOW]"
+	pv -cN input $< | \
+		pigz -dc | \
+		parallel --no-notice --pipe --line-buffer --block 50M python3 ./filterpinyin.py | \
 		pigz -c | \
 		pv -cN output > $@
 
@@ -78,4 +126,6 @@ $(SUBTLD_DATA_FILE): $(NAME_DATA_FILE)
 .PHONY: clean
 clean:
 	@rm -fv $(NAME_DATA_FILE) \
-		$(SUBTLD_DATA_FILE)
+		$(SUB_DATA_FILE) \
+		$(SORTED_SUB_DATA_FILE) \
+		$(COUNTED_SUB_DATA_FILE)

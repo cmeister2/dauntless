@@ -1,2 +1,5 @@
 # tldextract for TLD extraction
 tldextract
+
+# nltk for classifying pinyin domains
+nltk

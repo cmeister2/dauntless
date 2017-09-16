@@ -1,0 +1,134 @@
+# Parameters for creating the test file
+TEST_DATA_FILE := ./testdns.json.gz
+TEST_DATA_LINES := 500000
+
+# The data file which is used as input to this whole process
+DATA_FILE ?= $(TEST_DATA_FILE)
+DATA_FILE_DIR := $(dir $(DATA_FILE))
+DATA_FILE_BASE := $(notdir $(DATA_FILE))
+
+# Name field from the data set
+NAME_DATA_FILE := $(DATA_FILE_DIR)name_$(DATA_FILE_BASE)
+
+# Subdomain and TLD from name set
+SUBTLD_DATA_FILE := $(DATA_FILE_DIR)subtld_$(DATA_FILE_BASE)
+SUBTLD_SUBSET_FILE := $(DATA_FILE_DIR)tldsubset_$(DATA_FILE_BASE)
+SORTED_SUBTLD_DATA_FILE := $(DATA_FILE_DIR)sorted_subtld_$(DATA_FILE_BASE)
+COUNTED_SUBTLD_DATA_FILE := $(DATA_FILE_DIR)counted_subtld_$(DATA_FILE_BASE)
+
+# Subdomain and TLD with pinyin filtered out.
+NONPINYIN_DATA_FILE := $(DATA_FILE_DIR)subtld_np_$(DATA_FILE_BASE)
+
+# Get the number of processors available for multithreaded apps
+NUM_PROCS := $(shell nproc)
+ifeq ($(NUM_PROCS),)
+NUM_PROCS := 1
+endif
+
+# Options for Sort
+SORT_MEMORY_LIMIT ?= 2G
+SORT_MEMORY_FOLDER ?= $(DATA_FILE_DIR)/.sorttmp
+
+# Print a summary of the information
+$(info ** Data File $(DATA_FILE))
+$(info ** [Step 1] Name Data $(NAME_DATA_FILE))
+$(info ** [Step 2] SubTLD Data $(SUBTLD_DATA_FILE))
+$(info ** [Step 3] Sorted SubTLD Data $(SORTED_SUBTLD_DATA_FILE))
+$(info ** [Step 4] Counted SubTLD Data $(COUNTED_SUBTLD_DATA_FILE))
+$(info ** [Step 5] Filtered Pinyin Data $(NONPINYIN_DATA_FILE))
+$(info ** NUM PROCS $(NUM_PROCS))
+$(info ** SORT OPTIONS $(SORT_MEMORY_LIMIT) $(SORT_MEMORY_FOLDER))
+
+# Make an "all" target.
+all: step5
+
+# For the purposes of CI, have a test data set of the first TEST_DATA_LINES
+# lines of the data set.
+create_test_data: $(TEST_DATA_FILE)
+$(TEST_DATA_FILE):
+	@if [ $(TEST_DATA_FILE) = $(DATA_FILE) ]; \
+		then \
+			echo "Test data cannot be created from itself"; \
+			exit 1; \
+		fi
+	@echo "Creating $@"
+	pv $(DATA_FILE) | pigz -dc | head -$(TEST_DATA_LINES) | pigz -c > $@
+
+# Use jq with parallels to generate the data set. Use line-buffer as a speed-up
+# which preserves lines (at the expense of CPU).  Use a big buffer because
+# otherwise jq doesn't do enough work. Finally, pipe everything to uniq
+# to naively deduplicate the output.
+step1: $(NAME_DATA_FILE)
+$(NAME_DATA_FILE): $(DATA_FILE)
+	@echo "Step 1 (jq extraction): Creating $@ from $<"
+	pv -cN input $< | \
+		pigz -dc | \
+		parallel --no-notice --pipe --line-buffer --block 50M jq -r .name | \
+		pv -cN postparallel | \
+		uniq | \
+		pv -cN postuniq | \
+		pigz -c | \
+		pv -cN output > $@
+
+# Use tldextract in python to extract the subdomain and tld. Output them as
+# a colon-separated file. This filters out all domains which don't have a
+# subdomain.
+step2: $(SUBTLD_DATA_FILE)
+$(SUBTLD_DATA_FILE): $(NAME_DATA_FILE)
+	@echo "Step 2 (tld extraction): Creating $@ from $<"
+	pv -cN input $< | \
+		pigz -dc | \
+		parallel --no-notice --pipe --line-buffer --block 50M python3 ./subtld.py | \
+		pv -cN postpython | \
+		pigz -c | \
+		pv -cN output > $@
+
+# At this point we're going to sort the subdomain/TLDs ready for counting.
+step3: $(SORTED_SUBTLD_DATA_FILE)
+$(SORTED_SUBTLD_DATA_FILE): $(SUBTLD_DATA_FILE)
+	@echo "Step 3 (subdomain/tld sorting): Creating $@ from $<"
+	pv -cN input $< | \
+		pigz -dc | \
+		sort --parallel=$(NUM_PROCS) -S $(SORT_MEMORY_LIMIT) -T $(SORT_MEMORY_FOLDER) | \
+		pigz -c | \
+		pv -cN output > $@
+
+# Count the instances of the subdomain/TLD pairings. This reduces the number of
+# rows that we need to parse.
+step4: $(COUNTED_SUBTLD_DATA_FILE)
+$(COUNTED_SUBTLD_DATA_FILE): $(SORTED_SUBTLD_DATA_FILE)
+	@echo "Step 4 (subdomain/tld counting): Creating $@ from $<"
+	pv -cN input $< | \
+		pigz -dc | \
+		uniq -c | \
+		pigz -c | \
+		pv -cN output > $@
+
+# Use the filterpinyin script to filter out domains which look like pinyin.
+# This doesn't have to be perfect but we want to get rid of the most obvious ones.
+step5: $(NONPINYIN_DATA_FILE)
+$(NONPINYIN_DATA_FILE): $(COUNTED_SUBTLD_DATA_FILE)
+	@echo "Step 5 (pinyin filtering): Creating $@ from $< [SLOW]"
+	pv -cN input $< | \
+		pigz -dc | \
+		parallel --no-notice --pipe --line-buffer --block 50M python3 ./filterpinyin.py | \
+		pigz -c | \
+		pv -cN output > $@
+
+# Extra targets
+
+# Generate a random small set of lines from the subtld file to use for NTLK training
+subtld_subset: $(SUBTLD_SUBSET_FILE)
+$(SUBTLD_SUBSET_FILE): $(SUBTLD_DATA_FILE)
+	@echo "Creating $@ from $<"
+	pv -cN input $< | \
+		pigz -dc | \
+		perl -ne 'print if (rand() < .0005)' | \
+		pigz -c | \
+		pv -cN output > $@
+
+# Have a target to clean up all generated files
+.PHONY: clean
+clean:
+	@rm -fv $(NAME_DATA_FILE) \
+		$(SUBTLD_DATA_FILE)
