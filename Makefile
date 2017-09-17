@@ -8,14 +8,18 @@ DATA_FILE_DIR := $(dir $(DATA_FILE))
 DATA_FILE_BASE := $(notdir $(DATA_FILE))
 
 # Name field from the data set
-NAME_DATA_FILE := $(DATA_FILE_DIR)name_$(DATA_FILE_BASE)
+NAME_DATA_FILE := $(DATA_FILE_DIR)step1.name_$(DATA_FILE_BASE)
 
 # Subdomain from name set
-SUB_DATA_FILE := $(DATA_FILE_DIR)subdomain_$(DATA_FILE_BASE)
+SUB_DATA_FILE := $(DATA_FILE_DIR)step2.subdomain_$(DATA_FILE_BASE)
+SORTED_SUB_DATA_FILE := $(DATA_FILE_DIR)step3.sorted_sub_$(DATA_FILE_BASE)
+COUNTED_SUB_DATA_FILE := $(DATA_FILE_DIR)step4.counted_sub_$(DATA_FILE_BASE)
+TOP_SUB_DATA_FILE := $(DATA_FILE_DIR)step5.top_sub_$(DATA_FILE_BASE)
+TOP_X_SUBS_DATA_FILE := $(DATA_FILE_DIR)step6.top_xsubs_$(DATA_FILE_BASE)
+TOP_X_SUBS_NP_DATA_FILE := $(DATA_FILE_DIR)step7.top_xsubs_np_$(DATA_FILE_BASE)
+
+TOP_X_SUBS_P_DATA_FILE := $(DATA_FILE_DIR)step7.top_xsubs_p_$(DATA_FILE_BASE).log
 SUBSET_SUB_DATA_FILE := $(DATA_FILE_DIR)subset_subdomain_$(DATA_FILE_BASE)
-SORTED_SUB_DATA_FILE := $(DATA_FILE_DIR)sorted_sub_$(DATA_FILE_BASE)
-COUNTED_SUB_DATA_FILE := $(DATA_FILE_DIR)counted_sub_$(DATA_FILE_BASE)
-TOP_SUB_DATA_FILE := $(DATA_FILE_DIR)top_sub_$(DATA_FILE_BASE)
 
 NUM_PROCS := $(shell nproc)
 ifeq ($(NUM_PROCS),)
@@ -26,6 +30,9 @@ endif
 SORT_MEMORY_LIMIT ?= 2G
 SORT_MEMORY_FOLDER ?= $(DATA_FILE_DIR)/.sorttmp
 
+# Options for limiting output
+TOP_FIRST_LIMIT ?= 2000000
+
 # Print a summary of the information
 $(info ** [Step 0] Data File               $(DATA_FILE))
 $(info ** [Step 1] Name Data               $(NAME_DATA_FILE))
@@ -33,12 +40,13 @@ $(info ** [Step 2] Subdomain Data          $(SUB_DATA_FILE))
 $(info ** [Step 3] Sorted Subdomain Data   $(SORTED_SUB_DATA_FILE))
 $(info ** [Step 4] Counted Subdomain Data  $(COUNTED_SUB_DATA_FILE))
 $(info ** [Step 5] Top Subdomain Data      $(TOP_SUB_DATA_FILE))
-# $(info ** [Step 5] Filtered Pinyin Data $(NONPINYIN_DATA_FILE))
+$(info ** [Step 6] Top $(TOP_FIRST_LIMIT) Subs        $(TOP_X_SUBS_DATA_FILE))
+$(info ** [Step 7] Top Sub no Pinyin Data  $(TOP_X_SUBS_NP_DATA_FILE))
 $(info ** NUM PROCS $(NUM_PROCS))
 $(info ** SORT OPTIONS $(SORT_MEMORY_LIMIT) $(SORT_MEMORY_FOLDER))
 
 # Make an "all" target.
-all: step5
+all: step7
 
 # For the purposes of CI, have a test data set of the first TEST_DATA_LINES
 # lines of the data set.
@@ -111,16 +119,63 @@ $(TOP_SUB_DATA_FILE): $(COUNTED_SUB_DATA_FILE)
 		pigz -c | \
 		pv -cN output > $@
 
-# Use the filterpinyin script to filter out domains which look like pinyin.
-# This doesn't have to be perfect but we want to get rid of the most obvious ones.
-nonstep5: $(NONPINYIN_DATA_FILE)
-$(NONPINYIN_DATA_FILE): $(COUNTED_SUB_DATA_FILE)
-	@echo "Step 5 (pinyin filtering): Creating $@ from $< [SLOW]"
+# Take the top X subdomains
+step6: $(TOP_X_SUBS_DATA_FILE)
+$(TOP_X_SUBS_DATA_FILE): $(TOP_SUB_DATA_FILE)
+	@echo "Step 6 (limit top subdomains): Creating $@ from $<"
 	pv -cN input $< | \
 		pigz -dc | \
-		parallel --no-notice --pipe --line-buffer --block 50M python3 ./filterpinyin.py | \
+		head -$(TOP_FIRST_LIMIT) | \
 		pigz -c | \
 		pv -cN output > $@
+
+# Use the filterpinyin script to filter out domains which look like pinyin.
+# This doesn't have to be perfect but we want to get rid of the most obvious ones.
+step7: $(TOP_X_SUBS_NP_DATA_FILE)
+$(TOP_X_SUBS_NP_DATA_FILE): $(TOP_X_SUBS_DATA_FILE)
+	@echo "Step 7 (pinyin filtering): Creating $@ from $<"
+	pv -cN input $< | \
+		pigz -dc | \
+		parallel --no-notice --pipe --line-buffer --block 1M python3 ./filterpinyinsub.py 2>$(TOP_X_SUBS_P_DATA_FILE) | \
+		pigz -c | \
+		pv -cN output > $@
+
+# Make the results files
+results/top1000000_count: $(TOP_X_SUBS_NP_DATA_FILE)
+	@echo "Make top 1000000 with count"
+	pv -cN input $< | \
+                pigz -dc | \
+                head -1000000 > $@
+
+results/top100000_count: results/top1000000_count
+	@echo "Make top 100000 with count"
+	head -100000 < $< > $@
+
+results/top10000_count: results/top100000_count
+	@echo "Make top 10000 with count"
+	head -10000 < $< > $@
+
+results/top1000_count: results/top10000_count
+	@echo "Make top 10000 with count"
+	head -1000 < $< > $@
+
+results/top1000000: results/top1000000_count
+	@echo "Make top 1000000 without count"
+	python3 ./uncount.py < $< > $@
+
+results/top100000: results/top100000_count
+	@echo "Make top 100000 without count"
+	python3 ./uncount.py < $< > $@
+
+results/top10000: results/top10000_count
+	@echo "Make top 10000 without count"
+	python3 ./uncount.py < $< > $@
+
+results/top1000: results/top1000_count
+	@echo "Make top 1000 without count"
+	python3 ./uncount.py < $< > $@
+
+top_results: results/top1000 results/top10000 results/top100000 results/top1000000
 
 # Have a target to clean up all generated files
 .PHONY: clean

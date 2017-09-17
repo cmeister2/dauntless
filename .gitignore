@@ -2,5 +2,6 @@ name_testdns.json.gz
 counted_sub_testdns.json.gz
 sorted_sub_testdns.json.gz
 subdomain_testdns.json.gz
+step*_testdns.json.g*
 *.pyc
 __pycache__

@@ -415,3 +415,12 @@ SYLLABLES = [
     "zun",
     "zuo",
 ]
+
+COMPOUND_SYLLABLES = [
+    "xinxi",
+    "bocai",
+    "zhifu",
+    "ttyule",
+    "yulecheng",
+    "qipai",
+]
